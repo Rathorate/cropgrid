@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cropgrid
+      POSTGRES_USER: cropgrid
+      POSTGRES_PASSWORD: cropgrid_dev_only
+    ports: ["5432:5432"]
+    volumes: ["cropgrid-data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cropgrid -d cropgrid"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+  api:
+    build: ./apps/backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://cropgrid:cropgrid_dev_only@db:5432/cropgrid
+      CORS_ORIGINS: http://localhost:3000
+    ports: ["8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+volumes:
+  cropgrid-data:
