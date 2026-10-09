@@ -58,7 +58,7 @@ Keep the checkout in the Linux home directory (for example `~/projects/cropgrid`
 ```bash
 mkdir -p ~/projects
 cd ~/projects
-git clone <REPOSITORY_URL> cropgrid
+git clone https://github.com/Rathorate/cropgrid.git cropgrid
 cd cropgrid
 ```
 
@@ -81,10 +81,11 @@ Open a second Ubuntu terminal:
 cd ~/projects/cropgrid/apps/web
 corepack enable
 pnpm install --frozen-lockfile
+cp .env.example .env.local
 pnpm dev --hostname 0.0.0.0
 ```
 
-Open `http://localhost:3000` in the Windows browser and `http://localhost:8000/docs` for the API documentation. The web `.env.example` points the frontend at the API on port 8000. Add an OpenAI key only to `apps/backend/.env` if you want to exercise the optional voice parser; do not commit that `.env` file.
+Open `http://localhost:3000` in the Windows browser and `http://localhost:8000/docs` for the API documentation. Next.js reads `.env.local`, not `.env.example`; the copied file points the frontend at the API on port 8000. If you run the API on another port, update `NEXT_PUBLIC_API_URL` in `.env.local` and restart the web dev server. Add an OpenAI key only to `apps/backend/.env` if you want to exercise the optional voice parser; do not commit that `.env` file.
 
 ### Resolve `Address already in use` on port 8000
 
@@ -98,16 +99,16 @@ If it returns `200` and `{"status":"ok",...}`, leave that backend running and co
 
 ```bash
 sudo ss -ltnp 'sport = :8000'
-ps -fp <PID>
+docker ps --filter publish=8000 --format 'table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}'
 ```
 
-If the PID is an old CropGrid Uvicorn process, stop that process with `kill <PID>` (or press Ctrl+C in its original terminal), then restart Uvicorn on port 8000. If the port belongs to something else, run CropGrid on port 8001 instead:
+If the listener is an old CropGrid Uvicorn process, stop it with Ctrl+C in its original terminal. If Docker shows another container publishing the port, stop only that named container if you are sure it is safe, for example `docker stop movie_chromadb`; this pauses that container without deleting it. Then confirm the port is free with `sudo ss -ltnp 'sport = :8000'`. If you need that other service to keep running, use port 8001 for CropGrid instead:
 
 ```bash
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8001 --env-file .env
 ```
 
-Then set `NEXT_PUBLIC_API_URL=http://localhost:8001` in `apps/web/.env.local` and restart the Next.js dev server.
+Then set `NEXT_PUBLIC_API_URL=http://localhost:8001` in `apps/web/.env.local` and restart the Next.js dev server. Open the **frontend** at `http://localhost:3000`; opening `http://localhost:8000/` shows `{"detail":"Not Found"}` because the API has no homepage route. Test the backend at `http://localhost:8000/api/v1/health` or `http://localhost:8000/docs`.
 
 ### Test Paystack and AI locally
 

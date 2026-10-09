@@ -3,6 +3,7 @@ import unittest
 import httpx
 from app.main import app
 from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
 from app.database import SessionLocal
 from app.models import Inventory, PaymentTransaction
 
@@ -49,6 +50,29 @@ class CropGridApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 503)
         finally:
             if old_key is not None:
+                os.environ["OPENAI_API_KEY"] = old_key
+
+    def test_audio_parser_returns_reviewable_listing_draft(self):
+        import os
+        old_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "sk-test-mocked"
+        fake_client = SimpleNamespace(
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(text="We have 20 tons of ginger in Kaduna."))),
+            chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"crop_name":"Ginger","quantity_tons":20,"location_state":"Kaduna"}'))]))),
+        )
+        try:
+            with patch("openai.OpenAI", return_value=fake_client):
+                response = self.request("POST", "/api/v1/ai/parse-audio", files={"file": ("note.wav", b"mock audio bytes", "audio/wav")})
+            self.assertEqual(response.status_code, 200, response.text)
+            result = response.json()
+            self.assertEqual(result["transcript"], "We have 20 tons of ginger in Kaduna.")
+            self.assertEqual(result["draft"]["crop_name"], "Ginger")
+            self.assertEqual(result["draft"]["quantity_tons"], 20)
+            self.assertTrue(result["requires_human_review"])
+        finally:
+            if old_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
                 os.environ["OPENAI_API_KEY"] = old_key
 
     def test_payment_is_disabled_without_provider_key(self):
