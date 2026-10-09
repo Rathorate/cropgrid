@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import "./styles.css";
+import "./ai.css";
 
 export const metadata: Metadata = {
   title: "CropGrid — Trade better, grow together",

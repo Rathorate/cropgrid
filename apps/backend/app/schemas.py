@@ -1,4 +1,22 @@
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+class RegisterCreate(BaseModel):
+    full_name: str = Field(min_length=2, max_length=120)
+    email: str = Field(min_length=6, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    password: str = Field(min_length=10, max_length=128)
+    role: Literal["BUYER", "SELLER"]
+
+class LoginCreate(BaseModel):
+    email: str = Field(min_length=6, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    password: str = Field(min_length=1, max_length=128)
+
+class ListingReportCreate(BaseModel):
+    reason: Literal["SUSPICIOUS", "MISLEADING", "DUPLICATE", "OTHER"]
+    details: str = Field(default="", max_length=1000)
+
+class ListingReportUpdate(BaseModel):
+    status: Literal["REVIEWING", "RESOLVED", "DISMISSED"]
 
 class InventoryCreate(BaseModel):
     supplier_name: str = Field(default="CropGrid Supplier", min_length=2, max_length=120)

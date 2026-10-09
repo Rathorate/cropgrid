@@ -8,17 +8,27 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 import httpx
 from .database import Base, SessionLocal, engine, get_db
-from .models import Inventory, Order, PaymentTransaction
-from .schemas import InventoryCreate, OrderCreate, PaymentInitialize
+from .models import Inventory, ListingReport, Order, PaymentTransaction, User
+from .schemas import InventoryCreate, ListingReportCreate, ListingReportUpdate, OrderCreate, PaymentInitialize
+from .auth import bootstrap_admin, get_current_user, require_roles, router as auth_router
 
 Base.metadata.create_all(bind=engine)
+for table, column, ddl in (
+    ("inventories", "seller_user_id", "ALTER TABLE inventories ADD COLUMN seller_user_id INTEGER REFERENCES users(id)"),
+    ("payment_transactions", "buyer_user_id", "ALTER TABLE payment_transactions ADD COLUMN buyer_user_id INTEGER REFERENCES users(id)"),
+):
+    if column not in {item["name"] for item in inspect(engine).get_columns(table)}:
+        with engine.begin() as connection:
+            connection.execute(text(ddl))
+bootstrap_admin()
 app = FastAPI(title="CropGrid API", version="0.2.0", description="CropGrid MVP API. Paystack checkout is available when configured; escrow and export compliance are not provided.")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type"])
+app.include_router(auth_router)
 
 def seed_demo_inventory():
     """Keep the local demo usable while still permitting an empty production database."""
@@ -56,8 +66,8 @@ def list_inventories(q: str = Query(default="", max_length=100), crop: str = Que
     return db.scalars(stmt.limit(100)).all()
 
 @app.post("/api/v1/inventories", status_code=201)
-def create_inventory(payload: InventoryCreate, db: Session = Depends(get_db)):
-    row = Inventory(**payload.model_dump())
+def create_inventory(payload: InventoryCreate, seller: User = Depends(require_roles("SELLER", "ADMIN")), db: Session = Depends(get_db)):
+    row = Inventory(**payload.model_dump(), seller_user_id=seller.id)
     db.add(row)
     db.commit()
     db.refresh(row)
@@ -107,7 +117,7 @@ async def paystack_request(path: str, *, method: str = "GET", payload: dict | No
     return result.get("data", {})
 
 @app.post("/api/v1/payments/initialize", status_code=201)
-async def initialize_payment(payload: PaymentInitialize, db: Session = Depends(get_db)):
+async def initialize_payment(payload: PaymentInitialize, buyer: User = Depends(require_roles("BUYER", "ADMIN")), db: Session = Depends(get_db)):
     if not os.getenv("PAYSTACK_SECRET_KEY", "").strip():
         raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
     inventory = db.scalar(select(Inventory).where(Inventory.id == payload.inventory_id).with_for_update())
@@ -135,7 +145,7 @@ async def initialize_payment(payload: PaymentInitialize, db: Session = Depends(g
     if amount_subunit < 5000:
         raise HTTPException(422, "Paystack NGN transactions must be at least ₦50")
     reference = "CG-" + uuid.uuid4().hex
-    payment = PaymentTransaction(inventory_id=inventory.id, buyer_name=payload.buyer_name.strip(), buyer_email=payload.buyer_email.lower(),
+    payment = PaymentTransaction(inventory_id=inventory.id, buyer_user_id=buyer.id, buyer_name=buyer.full_name, buyer_email=buyer.email,
         quantity_tons=payload.quantity_tons, currency="NGN", amount_subunit=amount_subunit, status="PENDING", reference=reference)
     db.add(payment)
     db.commit()
@@ -203,6 +213,18 @@ async def verify_payment(reference: str, db: Session = Depends(get_db)):
         "amount": str(Decimal(payment.amount_subunit) / 100), "quantity_tons": payment.quantity_tons,
         "message": "Payment confirmed." if payment.status == "SUCCESS" else "Payment needs manual review." if payment.status == "PAID_REVIEW" else "Payment is still pending." if payment.status == "PENDING" else "Payment was not successful."}
 
+@app.get("/api/v1/orders/me")
+def my_orders(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    statement = select(PaymentTransaction, Inventory).join(Inventory, PaymentTransaction.inventory_id == Inventory.id)
+    if user.role == "BUYER":
+        statement = statement.where(PaymentTransaction.buyer_user_id == user.id)
+    elif user.role == "SELLER":
+        statement = statement.where(Inventory.seller_user_id == user.id)
+    statement = statement.order_by(PaymentTransaction.created_at.desc()).limit(100)
+    return [{"reference": payment.reference, "crop_name": inventory.crop_name, "quantity_tons": payment.quantity_tons,
+             "total_amount_ngn": str(Decimal(payment.amount_subunit) / 100), "status": payment.status,
+             "created_at": payment.created_at.isoformat()} for payment, inventory in db.execute(statement).all()]
+
 @app.post("/api/v1/payments/webhook")
 async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
     secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
@@ -224,7 +246,7 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
     return {"received": True}
 
 @app.post("/api/v1/ai/parse-audio")
-async def parse_audio(file: UploadFile = File(...)):
+async def parse_audio(file: UploadFile = File(...), seller: User = Depends(require_roles("SELLER", "ADMIN"))):
     allowed = {"audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/mpga"}
     if file.content_type not in allowed:
         raise HTTPException(415, "Upload an MP3, MP4, WAV, WebM, or OGG audio file")
@@ -247,3 +269,28 @@ async def parse_audio(file: UploadFile = File(...)):
         raise
     except Exception as exc:
         raise HTTPException(502, "AI transcription is temporarily unavailable") from exc
+
+@app.post("/api/v1/inventories/{inventory_id}/reports", status_code=201)
+def report_listing(inventory_id: int, payload: ListingReportCreate, reporter: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not db.get(Inventory, inventory_id):
+        raise HTTPException(404, "Listing not found")
+    report = ListingReport(inventory_id=inventory_id, reporter_user_id=reporter.id, reason=payload.reason, details=payload.details.strip())
+    db.add(report)
+    db.commit()
+    db.refresh(report)
+    return {"id": report.id, "status": report.status, "message": "Thanks. The listing was sent to our review queue."}
+
+@app.get("/api/v1/admin/reports")
+def list_reports(_: User = Depends(require_roles("ADMIN")), db: Session = Depends(get_db)):
+    rows = db.execute(select(ListingReport, Inventory, User).join(Inventory, ListingReport.inventory_id == Inventory.id).join(User, ListingReport.reporter_user_id == User.id).order_by(ListingReport.created_at.desc()).limit(200)).all()
+    return [{"id": report.id, "inventory_id": inventory.id, "crop_name": inventory.crop_name, "reporter_email": reporter.email,
+             "reason": report.reason, "details": report.details, "status": report.status, "created_at": report.created_at.isoformat()} for report, inventory, reporter in rows]
+
+@app.patch("/api/v1/admin/reports/{report_id}")
+def update_report(report_id: int, payload: ListingReportUpdate, _: User = Depends(require_roles("ADMIN")), db: Session = Depends(get_db)):
+    report = db.get(ListingReport, report_id)
+    if not report:
+        raise HTTPException(404, "Report not found")
+    report.status = payload.status
+    db.commit()
+    return {"id": report.id, "status": report.status}

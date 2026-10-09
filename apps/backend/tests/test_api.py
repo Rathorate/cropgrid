@@ -1,22 +1,78 @@
 import asyncio
 import unittest
+import uuid
 import httpx
 from app.main import app
 from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 from app.database import SessionLocal
-from app.models import Inventory, PaymentTransaction
+from app.models import Inventory, ListingReport, PaymentTransaction, User
+from app.auth import hash_password
 
 class CropGridApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.transport = httpx.ASGITransport(app=app)
 
+    def setUp(self):
+        self.cookies = httpx.Cookies()
+
     def request(self, method, path, **kwargs):
         async def send():
-            async with httpx.AsyncClient(transport=self.transport, base_url="http://testserver") as client:
-                return await client.request(method, path, **kwargs)
+            async with httpx.AsyncClient(transport=self.transport, base_url="http://testserver", cookies=self.cookies) as client:
+                response = await client.request(method, path, **kwargs)
+                self.cookies.update(client.cookies)
+                return response
         return asyncio.run(send())
+
+    def register_test_user(self, role="BUYER"):
+        email = f"test-{uuid.uuid4().hex}@example.com"
+        response = self.request("POST", "/api/v1/auth/register", json={"full_name":"CropGrid Test User", "email":email, "password":"test-password-123", "role":role})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    def test_buyer_signup_login_and_admin_role_is_not_public(self):
+        user = self.register_test_user()
+        self.assertEqual(user["role"], "BUYER")
+        self.assertEqual(self.request("GET", "/api/v1/auth/me").json()["email"], user["email"])
+        self.assertEqual(self.request("POST", "/api/v1/auth/logout").status_code, 204)
+        self.assertEqual(self.request("GET", "/api/v1/auth/me").status_code, 401)
+        self.assertEqual(self.request("POST", "/api/v1/auth/login", json={"email":user["email"], "password":"wrong-password"}).status_code, 401)
+        self.assertEqual(self.request("POST", "/api/v1/auth/login", json={"email":user["email"], "password":"test-password-123"}).status_code, 200)
+        denied = self.request("POST", "/api/v1/auth/register", json={"full_name":"Bad Admin", "email":f"admin-{uuid.uuid4().hex}@example.com", "password":"test-password-123", "role":"ADMIN"})
+        self.assertEqual(denied.status_code, 422)
+
+    def test_seller_actions_reject_guests_and_buyers(self):
+        audio = {"file": ("note.wav", b"mock audio", "audio/wav")}
+        self.assertEqual(self.request("POST", "/api/v1/ai/parse-audio", files=audio).status_code, 401)
+        self.register_test_user("BUYER")
+        self.assertEqual(self.request("POST", "/api/v1/ai/parse-audio", files=audio).status_code, 403)
+        listing_payload = {"crop_name":"Yam", "quantity_tons":1, "location_state":"Kano", "asking_price_per_ton_ngn":50000}
+        self.assertEqual(self.request("POST", "/api/v1/inventories", json=listing_payload).status_code, 403)
+
+    def test_listing_report_is_admin_reviewed(self):
+        self.register_test_user("BUYER")
+        listing = self.request("GET", "/api/v1/inventories").json()[0]
+        created = self.request("POST", f"/api/v1/inventories/{listing['id']}/reports", json={"reason":"MISLEADING", "details":"Test report"})
+        self.assertEqual(created.status_code, 201, created.text)
+        report_id = created.json()["id"]
+        self.assertEqual(self.request("GET", "/api/v1/admin/reports").status_code, 403)
+        admin_email = f"admin-{uuid.uuid4().hex}@example.com"
+        with SessionLocal() as db:
+            db.add(User(full_name="Test Administrator", email=admin_email, password_hash=hash_password("admin-test-password-123"), role="ADMIN"))
+            db.commit()
+        self.cookies.clear()
+        signed_in = self.request("POST", "/api/v1/auth/login", json={"email":admin_email, "password":"admin-test-password-123"})
+        self.assertEqual(signed_in.status_code, 200, signed_in.text)
+        rows = self.request("GET", "/api/v1/admin/reports")
+        self.assertEqual(rows.status_code, 200, rows.text)
+        self.assertTrue(any(row["id"] == report_id for row in rows.json()))
+        updated = self.request("PATCH", f"/api/v1/admin/reports/{report_id}", json={"status":"REVIEWING"})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(updated.json()["status"], "REVIEWING")
+        with SessionLocal() as db:
+            db.delete(db.get(ListingReport, report_id))
+            db.commit()
 
     def test_health_reports_development_mode(self):
         response = self.request("GET", "/api/v1/health")
@@ -27,6 +83,8 @@ class CropGridApiTests(unittest.TestCase):
         rows = self.request("GET", "/api/v1/inventories", params={"crop": "Ginger"})
         self.assertEqual(rows.status_code, 200)
         self.assertTrue(any(row["crop_name"] == "Ginger" for row in rows.json()))
+        self.assertEqual(self.request("POST", "/api/v1/inventories", json={"crop_name":"Yam", "quantity_tons":1, "location_state":"Kano", "asking_price_per_ton_ngn":50}).status_code, 401)
+        self.register_test_user("SELLER")
         invalid = self.request("POST", "/api/v1/inventories", json={"crop_name":"X", "quantity_tons":0, "location_state":"Kano", "asking_price_per_ton_ngn":0})
         self.assertEqual(invalid.status_code, 422)
 
@@ -44,6 +102,7 @@ class CropGridApiTests(unittest.TestCase):
 
     def test_audio_parser_requires_provider_configuration(self):
         import os
+        self.register_test_user("SELLER")
         old_key = os.environ.pop("OPENAI_API_KEY", None)
         try:
             response = self.request("POST", "/api/v1/ai/parse-audio", files={"file": ("note.wav", b"audio", "audio/wav")})
@@ -54,6 +113,7 @@ class CropGridApiTests(unittest.TestCase):
 
     def test_audio_parser_returns_reviewable_listing_draft(self):
         import os
+        self.register_test_user("SELLER")
         old_key = os.environ.get("OPENAI_API_KEY")
         os.environ["OPENAI_API_KEY"] = "sk-test-mocked"
         fake_client = SimpleNamespace(
@@ -77,6 +137,7 @@ class CropGridApiTests(unittest.TestCase):
 
     def test_payment_is_disabled_without_provider_key(self):
         import os
+        self.register_test_user("BUYER")
         old_key = os.environ.pop("PAYSTACK_SECRET_KEY", None)
         try:
             response = self.request("POST", "/api/v1/payments/initialize", json={"inventory_id":1,"quantity_tons":1,"buyer_name":"Test Buyer","buyer_email":"buyer@example.com","currency":"NGN"})
@@ -87,6 +148,7 @@ class CropGridApiTests(unittest.TestCase):
 
     def test_payment_initialization_uses_server_inventory_price(self):
         import os
+        self.register_test_user("BUYER")
         old_key = os.environ.get("PAYSTACK_SECRET_KEY")
         os.environ["PAYSTACK_SECRET_KEY"] = "sk_test_unit_test"
         try:
@@ -102,6 +164,9 @@ class CropGridApiTests(unittest.TestCase):
             sent = provider.await_args.kwargs["payload"]
             self.assertEqual(sent["amount"], 18_500_000)
             self.assertTrue(result["authorization_url"].startswith("https://checkout.paystack.com/"))
+            history = self.request("GET", "/api/v1/orders/me")
+            self.assertEqual(history.status_code, 200, history.text)
+            self.assertTrue(any(order["reference"] == result["reference"] and order["crop_name"] == "Ginger" for order in history.json()))
             with SessionLocal() as db:
                 row = db.query(PaymentTransaction).filter_by(reference=result["reference"]).one()
                 db.delete(row)
