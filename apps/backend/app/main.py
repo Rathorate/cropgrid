@@ -1,15 +1,22 @@
 import os
 import secrets
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+import hashlib
+import hmac
+import json
+import uuid
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+import httpx
 from .database import Base, SessionLocal, engine, get_db
-from .models import Inventory, Order
-from .schemas import InventoryCreate, OrderCreate
+from .models import Inventory, Order, PaymentTransaction
+from .schemas import InventoryCreate, OrderCreate, PaymentInitialize
 
 Base.metadata.create_all(bind=engine)
-app = FastAPI(title="CropGrid API", version="0.1.0", description="Development MVP API. Payment and compliance actions are simulations.")
+app = FastAPI(title="CropGrid API", version="0.2.0", description="CropGrid MVP API. Paystack checkout is available when configured; escrow and export compliance are not provided.")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
 
@@ -82,6 +89,139 @@ def export_document_draft(order_id: int, db: Session = Depends(get_db)):
             "order_reference": order.reference, "commodity": inventory.crop_name if inventory else None,
             "exporter": "To be verified", "destination_port": "To be supplied", "hs_code": "Requires customs verification",
             "fob_value_ngn": order.total_amount_ngn, "required_follow_up": ["Verify exporter registration", "Confirm HS code with licensed customs professional", "Obtain applicable phytosanitary inspection", "Complete official CBN Form NXP process"]}
+
+async def paystack_request(path: str, *, method: str = "GET", payload: dict | None = None):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.request(method, f"https://api.paystack.co{path}", headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}, json=payload)
+    except httpx.RequestError as exc:
+        raise HTTPException(502, "Could not connect to the payment provider. Please retry.") from exc
+    if response.status_code >= 400:
+        raise HTTPException(502, "The payment provider could not process this request.")
+    result = response.json()
+    if not result.get("status"):
+        raise HTTPException(502, "The payment provider rejected this request.")
+    return result.get("data", {})
+
+@app.post("/api/v1/payments/initialize", status_code=201)
+async def initialize_payment(payload: PaymentInitialize, db: Session = Depends(get_db)):
+    if not os.getenv("PAYSTACK_SECRET_KEY", "").strip():
+        raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
+    inventory = db.scalar(select(Inventory).where(Inventory.id == payload.inventory_id).with_for_update())
+    if not inventory:
+        raise HTTPException(404, "Listing not found")
+    now = datetime.now(timezone.utc)
+    pending_payments = db.scalars(select(PaymentTransaction).where(PaymentTransaction.status == "PENDING")).all()
+    active_reserved = 0.0
+    expired_any = False
+    for pending in pending_payments:
+        created = pending.created_at.replace(tzinfo=timezone.utc) if pending.created_at.tzinfo is None else pending.created_at.astimezone(timezone.utc)
+        if created < now - timedelta(minutes=20):
+            pending.status = "EXPIRED"
+            expired_any = True
+        elif pending.inventory_id == inventory.id:
+            active_reserved += pending.quantity_tons
+    db.flush()
+    if expired_any:
+        db.commit()
+        inventory = db.scalar(select(Inventory).where(Inventory.id == payload.inventory_id).with_for_update())
+    if payload.quantity_tons > inventory.quantity_tons - active_reserved:
+        raise HTTPException(422, "Requested quantity exceeds available inventory")
+    total_ngn = (Decimal(str(inventory.asking_price_per_ton_ngn)) * Decimal(str(payload.quantity_tons))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    amount_subunit = int(total_ngn * 100)
+    if amount_subunit < 5000:
+        raise HTTPException(422, "Paystack NGN transactions must be at least ₦50")
+    reference = "CG-" + uuid.uuid4().hex
+    payment = PaymentTransaction(inventory_id=inventory.id, buyer_name=payload.buyer_name.strip(), buyer_email=payload.buyer_email.lower(),
+        quantity_tons=payload.quantity_tons, currency="NGN", amount_subunit=amount_subunit, status="PENDING", reference=reference)
+    db.add(payment)
+    db.commit()
+    callback_url = os.getenv("PAYSTACK_CALLBACK_URL", "http://localhost:3000/payment/return")
+    try:
+        checkout = await paystack_request("/transaction/initialize", method="POST", payload={
+            "email": payment.buyer_email, "amount": amount_subunit, "currency": "NGN", "reference": reference,
+            "callback_url": callback_url, "metadata": {"inventory_id": inventory.id, "quantity_tons": payload.quantity_tons},
+        })
+    except HTTPException:
+        payment.status = "FAILED"
+        db.commit()
+        raise
+    authorization_url = checkout.get("authorization_url")
+    if not authorization_url or not authorization_url.startswith("https://checkout.paystack.com/"):
+        payment.status = "FAILED"
+        db.commit()
+        raise HTTPException(502, "The payment provider returned an invalid checkout URL.")
+    payment.authorization_url = authorization_url
+    db.commit()
+    return {"reference": reference, "authorization_url": authorization_url, "currency": "NGN", "amount": str(total_ngn), "status": payment.status}
+
+async def verify_and_record_payment(reference: str, db: Session):
+    payment = db.scalar(select(PaymentTransaction).where(PaymentTransaction.reference == reference).with_for_update())
+    if not payment:
+        raise HTTPException(404, "Payment reference not found")
+    if payment.status in {"SUCCESS", "PAID_REVIEW", "FAILED"}:
+        return payment
+    provider = await paystack_request(f"/transaction/verify/{reference}")
+    try:
+        provider_amount = int(provider.get("amount", -1))
+    except (TypeError, ValueError):
+        provider_amount = -1
+    provider_succeeded = provider.get("status") == "success"
+    verified = (provider.get("reference") == payment.reference
+        and provider_succeeded
+        and provider.get("currency") == payment.currency
+        and provider_amount == payment.amount_subunit)
+    if provider_succeeded:
+        if not verified or payment.status == "EXPIRED":
+            payment.status = "PAID_REVIEW"
+            payment.provider_transaction_id = str(provider.get("id", "")) or None
+            db.commit()
+            return payment
+        inventory = db.scalar(select(Inventory).where(Inventory.id == payment.inventory_id).with_for_update())
+        if inventory and inventory.quantity_tons >= payment.quantity_tons:
+            inventory.quantity_tons = round(inventory.quantity_tons - payment.quantity_tons, 4)
+            payment.status = "SUCCESS"
+        else:
+            # Provider has captured a valid payment but the stock is gone. Do
+            # not mark it as fulfilled; it needs a manual refund/reconciliation.
+            payment.status = "PAID_REVIEW"
+        payment.provider_transaction_id = str(provider.get("id", "")) or None
+        db.commit()
+    elif provider.get("status") in {"failed", "abandoned"}:
+        payment.status = "FAILED"
+        payment.provider_transaction_id = str(provider.get("id", "")) or None
+        db.commit()
+    return payment
+
+@app.get("/api/v1/payments/verify/{reference}")
+async def verify_payment(reference: str, db: Session = Depends(get_db)):
+    payment = await verify_and_record_payment(reference, db)
+    return {"reference": payment.reference, "status": payment.status, "currency": payment.currency,
+        "amount": str(Decimal(payment.amount_subunit) / 100), "quantity_tons": payment.quantity_tons,
+        "message": "Payment confirmed." if payment.status == "SUCCESS" else "Payment needs manual review." if payment.status == "PAID_REVIEW" else "Payment is still pending." if payment.status == "PENDING" else "Payment was not successful."}
+
+@app.post("/api/v1/payments/webhook")
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(503, "Payment webhook is not configured")
+    raw = await request.body()
+    supplied = request.headers.get("x-paystack-signature", "")
+    expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(401, "Invalid payment webhook signature")
+    try:
+        event = json.loads(raw or b"{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "Malformed webhook payload") from exc
+    if event.get("event") == "charge.success":
+        reference = str((event.get("data") or {}).get("reference", ""))
+        if reference:
+            await verify_and_record_payment(reference, db)
+    return {"received": True}
 
 @app.post("/api/v1/ai/parse-audio")
 async def parse_audio(file: UploadFile = File(...)):

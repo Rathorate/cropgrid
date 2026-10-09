@@ -29,3 +29,10 @@ class OrderOut(BaseModel):
     total_amount_ngn: float
     status: str
     reference: str
+
+class PaymentInitialize(BaseModel):
+    inventory_id: int = Field(gt=0)
+    quantity_tons: float = Field(gt=0, le=100000)
+    buyer_name: str = Field(min_length=2, max_length=120)
+    buyer_email: str = Field(min_length=6, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    currency: str = Field(default="NGN", pattern="^NGN$")
