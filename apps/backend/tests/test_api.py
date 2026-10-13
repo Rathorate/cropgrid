@@ -138,32 +138,32 @@ class CropGridApiTests(unittest.TestCase):
     def test_payment_is_disabled_without_provider_key(self):
         import os
         self.register_test_user("BUYER")
-        old_key = os.environ.pop("PAYSTACK_SECRET_KEY", None)
+        old_values = {key: os.environ.pop(key, None) for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")}
         try:
             response = self.request("POST", "/api/v1/payments/initialize", json={"inventory_id":1,"quantity_tons":1,"buyer_name":"Test Buyer","buyer_email":"buyer@example.com","currency":"NGN"})
             self.assertEqual(response.status_code, 503)
         finally:
-            if old_key is not None:
-                os.environ["PAYSTACK_SECRET_KEY"] = old_key
+            for key, value in old_values.items():
+                if value is not None: os.environ[key] = value
 
     def test_payment_initialization_uses_server_inventory_price(self):
         import os
         self.register_test_user("BUYER")
-        old_key = os.environ.get("PAYSTACK_SECRET_KEY")
-        os.environ["PAYSTACK_SECRET_KEY"] = "sk_test_unit_test"
+        old_values = {key: os.environ.get(key) for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")}
+        os.environ.update(MONNIFY_API_KEY="MK_TEST_unit_test", MONNIFY_SECRET_KEY="SK_TEST_unit_test", MONNIFY_CONTRACT_CODE="contract_test")
         try:
             listings = self.request("GET", "/api/v1/inventories").json()
             listing = next(row for row in listings if row["crop_name"] == "Ginger")
-            with patch("app.main.paystack_request", new_callable=AsyncMock) as provider:
-                provider.return_value = {"authorization_url":"https://checkout.paystack.com/example"}
+            with patch("app.main.monnify_request", new_callable=AsyncMock) as provider:
+                provider.return_value = {"checkoutUrl":"https://sandbox.monnify.com/checkout/example"}
                 response = self.request("POST", "/api/v1/payments/initialize", json={"inventory_id":listing["id"],"quantity_tons":0.1,"buyer_name":"Test Buyer","buyer_email":"buyer@example.com","currency":"NGN"})
             self.assertEqual(response.status_code, 201, response.text)
             result = response.json()
             self.assertEqual(result["amount"], "185000.00")
             self.assertEqual(result["currency"], "NGN")
             sent = provider.await_args.kwargs["payload"]
-            self.assertEqual(sent["amount"], 18_500_000)
-            self.assertTrue(result["authorization_url"].startswith("https://checkout.paystack.com/"))
+            self.assertEqual(sent["amount"], 185000.0)
+            self.assertTrue(result["authorization_url"].startswith("https://sandbox.monnify.com/"))
             history = self.request("GET", "/api/v1/orders/me")
             self.assertEqual(history.status_code, 200, history.text)
             self.assertTrue(any(order["reference"] == result["reference"] and order["crop_name"] == "Ginger" for order in history.json()))
@@ -172,28 +172,26 @@ class CropGridApiTests(unittest.TestCase):
                 db.delete(row)
                 db.commit()
         finally:
-            if old_key is None:
-                os.environ.pop("PAYSTACK_SECRET_KEY", None)
-            else:
-                os.environ["PAYSTACK_SECRET_KEY"] = old_key
+            for key, value in old_values.items():
+                if value is None: os.environ.pop(key, None)
+                else: os.environ[key] = value
 
     def test_payment_webhook_rejects_invalid_signature(self):
         import os
-        old_key = os.environ.get("PAYSTACK_SECRET_KEY")
-        os.environ["PAYSTACK_SECRET_KEY"] = "sk_test_unit_test"
+        old_values = {key: os.environ.get(key) for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")}
+        os.environ.update(MONNIFY_API_KEY="MK_TEST_unit_test", MONNIFY_SECRET_KEY="SK_TEST_unit_test", MONNIFY_CONTRACT_CODE="contract_test")
         try:
-            response = self.request("POST", "/api/v1/payments/webhook", json={"event":"charge.success"}, headers={"x-paystack-signature":"invalid"})
+            response = self.request("POST", "/api/v1/payments/webhook", json={"eventType":"SUCCESSFUL_TRANSACTION"}, headers={"monnify-signature":"invalid"})
             self.assertEqual(response.status_code, 401)
         finally:
-            if old_key is None:
-                os.environ.pop("PAYSTACK_SECRET_KEY", None)
-            else:
-                os.environ["PAYSTACK_SECRET_KEY"] = old_key
+            for key, value in old_values.items():
+                if value is None: os.environ.pop(key, None)
+                else: os.environ[key] = value
 
     def test_payment_verification_flags_provider_amount_mismatch(self):
         import os
-        old_key = os.environ.get("PAYSTACK_SECRET_KEY")
-        os.environ["PAYSTACK_SECRET_KEY"] = "sk_test_unit_test"
+        old_values = {key: os.environ.get(key) for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")}
+        os.environ.update(MONNIFY_API_KEY="MK_TEST_unit_test", MONNIFY_SECRET_KEY="SK_TEST_unit_test", MONNIFY_CONTRACT_CODE="contract_test")
         reference = "CG-test-amount-mismatch"
         try:
             listings = self.request("GET", "/api/v1/inventories").json()
@@ -201,8 +199,8 @@ class CropGridApiTests(unittest.TestCase):
             with SessionLocal() as db:
                 db.add(PaymentTransaction(inventory_id=listing["id"], buyer_name="Test Buyer", buyer_email="buyer@example.com", quantity_tons=1, currency="NGN", amount_subunit=185_000_000, status="PENDING", reference=reference))
                 db.commit()
-            with patch("app.main.paystack_request", new_callable=AsyncMock) as provider:
-                provider.return_value = {"reference": reference, "status": "success", "currency": "NGN", "amount": 1, "id": 123}
+            with patch("app.main.monnify_request", new_callable=AsyncMock) as provider:
+                provider.return_value = {"paymentReference": reference, "paymentStatus": "PAID", "currencyCode": "NGN", "amountPaid": "0.01", "transactionReference": "MNFY-123"}
                 response = self.request("GET", f"/api/v1/payments/verify/{reference}")
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["status"], "PAID_REVIEW")
@@ -211,15 +209,14 @@ class CropGridApiTests(unittest.TestCase):
                 db.delete(row)
                 db.commit()
         finally:
-            if old_key is None:
-                os.environ.pop("PAYSTACK_SECRET_KEY", None)
-            else:
-                os.environ["PAYSTACK_SECRET_KEY"] = old_key
+            for key, value in old_values.items():
+                if value is None: os.environ.pop(key, None)
+                else: os.environ[key] = value
 
     def test_verified_payment_reduces_stock_once(self):
         import os
-        old_key = os.environ.get("PAYSTACK_SECRET_KEY")
-        os.environ["PAYSTACK_SECRET_KEY"] = "sk_test_unit_test"
+        old_values = {key: os.environ.get(key) for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")}
+        os.environ.update(MONNIFY_API_KEY="MK_TEST_unit_test", MONNIFY_SECRET_KEY="SK_TEST_unit_test", MONNIFY_CONTRACT_CODE="contract_test")
         reference = "CG-test-success-idempotent"
         listing_id = None
         starting_quantity = None
@@ -231,8 +228,8 @@ class CropGridApiTests(unittest.TestCase):
             with SessionLocal() as db:
                 db.add(PaymentTransaction(inventory_id=listing_id, buyer_name="Test Buyer", buyer_email="buyer@example.com", quantity_tons=0.1, currency="NGN", amount_subunit=18_500_000, status="PENDING", reference=reference))
                 db.commit()
-            with patch("app.main.paystack_request", new_callable=AsyncMock) as provider:
-                provider.return_value = {"reference": reference, "status": "success", "currency": "NGN", "amount": 18_500_000, "id": 456}
+            with patch("app.main.monnify_request", new_callable=AsyncMock) as provider:
+                provider.return_value = {"paymentReference": reference, "paymentStatus": "PAID", "currencyCode": "NGN", "amountPaid": "185000.00", "transactionReference": "MNFY-456"}
                 confirmed = self.request("GET", f"/api/v1/payments/verify/{reference}")
                 self.assertEqual(confirmed.json()["status"], "SUCCESS")
                 repeated = self.request("GET", f"/api/v1/payments/verify/{reference}")
@@ -246,10 +243,9 @@ class CropGridApiTests(unittest.TestCase):
                 db.delete(payment)
                 db.commit()
         finally:
-            if old_key is None:
-                os.environ.pop("PAYSTACK_SECRET_KEY", None)
-            else:
-                os.environ["PAYSTACK_SECRET_KEY"] = old_key
+            for key, value in old_values.items():
+                if value is None: os.environ.pop(key, None)
+                else: os.environ[key] = value
 
 if __name__ == "__main__":
     unittest.main()

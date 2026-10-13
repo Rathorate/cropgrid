@@ -25,12 +25,15 @@ The frontend and backend communicate over HTTPS. The browser must be able to rea
    | `ADMIN_PASSWORD` | Strong private password (at least 16 characters); stored only in the hosting secret settings |
    | `OPENAI_API_KEY` | Your OpenAI key, if enabling the voice listing feature |
    | `OPENAI_LISTING_MODEL` | `gpt-4o-mini` (optional; this is the default) |
-   | `PAYSTACK_SECRET_KEY` | Paystack **test** secret key for sandbox testing; switch to a live key only after merchant approval and a reviewed launch |
-   | `PAYSTACK_CALLBACK_URL` | The frontend payment return URL, e.g. `https://<your-site>/payment/return` |
+   | `MONNIFY_ENV` | `sandbox` while testing; `production` only after approval and a reviewed launch |
+   | `MONNIFY_API_KEY` | Monnify sandbox API key |
+   | `MONNIFY_SECRET_KEY` | Monnify sandbox secret key |
+   | `MONNIFY_CONTRACT_CODE` | Monnify contract code |
+   | `MONNIFY_CALLBACK_URL` | The frontend payment return URL, e.g. `https://<your-site>/payment/return` |
 
    Keep secret values in the provider dashboard. Do not commit them to GitHub. The API Dockerfile uses the platform-provided `PORT`, and the backend normalizes standard PostgreSQL URL schemes to the installed Psycopg 3 driver.
 5. Deploy and open `https://<your-api-service>.onrender.com/api/v1/health`. It should return JSON with `"status":"ok"`. Also open `/docs` to check that the API documentation loads. The API supports buyer/seller registration and login using an HttpOnly session cookie; CORS must list the exact frontend origin and credentials are enabled for that origin.
-6. In the Paystack dashboard, register the webhook URL `https://<your-api-service>.onrender.com/api/v1/payments/webhook`. Configure the same Paystack secret key in the backend environment. The endpoint validates Paystack's HMAC-SHA512 signature and verifies the transaction with Paystack before updating inventory.
+6. In the Monnify dashboard, configure the transaction completion webhook URL `https://<your-api-service>.onrender.com/api/v1/payments/webhook`. Configure the matching secret in the backend environment. Production signatures are validated and each successful notification is verified with Monnify before updating inventory.
 
 ## 2. Deploy the frontend
 
@@ -44,13 +47,13 @@ The frontend and backend communicate over HTTPS. The browser must be able to rea
 
    This value is included in the browser bundle at build time, so redeploy after changing it. It is a public URL, not a secret.
 4. Deploy. Copy the final Vercel origin (scheme and hostname only, no path) into Render's `CORS_ORIGINS`, then redeploy the backend if needed.
-5. Open the Vercel site. Confirm the header says **API connected**, listings load from the API, buyer and seller registration/login work, only a seller can publish a listing, buyer checkout opens Paystack, listing reports can be submitted, and the FAQ is visible. Confirm a new listing remains after a page reload.
+5. Open the Vercel site. Confirm the header says **API connected**, listings load from the API, buyer and seller registration/login work, only a seller can publish a listing, buyer checkout opens Monnify, listing reports can be submitted, and the FAQ is visible. Confirm a new listing remains after a page reload.
 
 ## Payment currency and account requirements
 
-The initial checkout prices and charges orders in NGN. Nigerian Paystack merchants that have international payments enabled can accept eligible international cards; the cardholder's bank may convert the NGN charge to the card's currency while the merchant receives local-currency settlement. Direct USD-denominated settlement is a separate account capability and may require a USD domiciliary account. This app does not present an invented USD conversion rate or enable USD-priced checkout by default. Confirm account eligibility and settlement details with Paystack before enabling live transactions. Fees are not added to the buyer total by CropGrid; configure merchant pricing and fees with the provider.
+The initial checkout prices and charges orders in NGN through Monnify. Payment methods, international card support, settlement details, and fees depend on your merchant contract. This app does not invent an exchange rate or enable USD-priced checkout. Confirm eligibility and settlement with Monnify before live transactions.
 
-After deploying, test using Paystack test credentials and test payment methods, then verify a success, a declined/cancelled payment, repeat callback/webhook behavior, amount/currency mismatches, and unavailable inventory. No live money should be processed until authentication, seller payout/split, refunds, disputes, inventory reservation, audit logs, and reconciliation have been designed and tested. Current payment success goes to the CropGrid merchant account; it does not automatically pay suppliers.
+After deploying, test using Monnify sandbox credentials, then verify success, cancellation/decline, repeated callback/webhook behavior, amount/currency mismatch, and unavailable inventory. No live money should be processed until authentication, seller payout/split, refunds, disputes, inventory reservation, audit logs, and reconciliation have been designed and tested. Current payment success goes to the CropGrid merchant account; it does not automatically pay suppliers.
 
 ## 3. Test voice listing with AI
 
@@ -72,4 +75,4 @@ For production, push tested commits to `main`; Vercel and Render can deploy from
 
 ## Before accepting real orders or money
 
-This MVP now has buyer/seller accounts, server-side role checks, administrator provisioning, seller ownership for new listings, and a report review queue. It still lacks login rate limits, email verification and recovery, seller payout/splits, automated refunds/disputes, identity checks, verified grading, robust high-concurrency inventory reservations, and compliance integrations. Its sample order rows and market chart remain illustrative. Test payments with Paystack test credentials only. Add abuse protection, account recovery, audit trails, payout controls, reconciliation, and a security review before public launch. Do not advertise escrow or guaranteed quality until those systems exist and have been verified.
+This MVP now has buyer/seller accounts, server-side role checks, administrator provisioning, seller ownership for new listings, and a report review queue. It still lacks login rate limits, email verification and recovery, seller payout/splits, automated refunds/disputes, identity checks, verified grading, robust high-concurrency inventory reservations, and compliance integrations. Its sample order rows and market chart remain illustrative. Test payments with Monnify test credentials only. Add abuse protection, account recovery, audit trails, payout controls, reconciliation, and a security review before public launch. Do not advertise escrow or guaranteed quality until those systems exist and have been verified.
