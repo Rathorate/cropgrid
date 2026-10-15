@@ -9,7 +9,7 @@ type Verification = { reference: string; status: string; currency: string; amoun
 function apiBase() {
   const configured = process.env.NEXT_PUBLIC_API_URL;
   if (configured) return configured.replace(/\/$/, "");
-  if (["localhost", "127.0.0.1"].includes(window.location.hostname)) return "http://localhost:8000";
+  if (["localhost", "127.0.0.1"].includes(window.location.hostname)) return "http://localhost:8002";
   return "";
 }
 

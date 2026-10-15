@@ -20,7 +20,7 @@ const icons: Record<string,string> = { Ginger:"🫚", "Cashew nuts":"🥜", "Ses
 function getApiBase() {
   const configured = process.env.NEXT_PUBLIC_API_URL;
   if (configured) return configured.replace(/\/$/, "");
-  if (typeof window === "undefined" || ["localhost", "127.0.0.1"].includes(window.location.hostname)) return "http://localhost:8000";
+  if (typeof window === "undefined" || ["localhost", "127.0.0.1"].includes(window.location.hostname)) return "http://localhost:8002";
   return "";
 }
 const categoryCrops: Record<string, string[]> = {
