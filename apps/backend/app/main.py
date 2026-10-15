@@ -25,7 +25,7 @@ for table, column, ddl in (
         with engine.begin() as connection:
             connection.execute(text(ddl))
 bootstrap_admin()
-app = FastAPI(title="CropGrid API", version="0.3.0", description="CropGrid MVP API. Monnify NGN checkout is available when configured; escrow and export compliance are not provided.")
+app = FastAPI(title="CropGrid API", version="0.2.0", description="CropGrid MVP API. Paystack checkout is available when configured; escrow and export compliance are not provided.")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type"])
 app.include_router(auth_router)
@@ -100,34 +100,26 @@ def export_document_draft(order_id: int, db: Session = Depends(get_db)):
             "exporter": "To be verified", "destination_port": "To be supplied", "hs_code": "Requires customs verification",
             "fob_value_ngn": order.total_amount_ngn, "required_follow_up": ["Verify exporter registration", "Confirm HS code with licensed customs professional", "Obtain applicable phytosanitary inspection", "Complete official CBN Form NXP process"]}
 
-async def monnify_request(path: str, *, method: str = "GET", payload: dict | None = None):
-    api_key = os.getenv("MONNIFY_API_KEY", "").strip()
-    secret = os.getenv("MONNIFY_SECRET_KEY", "").strip()
-    contract = os.getenv("MONNIFY_CONTRACT_CODE", "").strip()
-    if not api_key or not secret or not contract:
-        raise HTTPException(503, "Payments are not configured. Add Monnify sandbox API key, secret, and contract code to the backend environment.")
-    base_url = "https://api.monnify.com" if os.getenv("MONNIFY_ENV", "sandbox").lower() == "production" else "https://sandbox.monnify.com"
+async def paystack_request(path: str, *, method: str = "GET", payload: dict | None = None):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
+    if not secret:
+        raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            login = await client.post(f"{base_url}/api/v1/auth/login", auth=(api_key, secret), headers={"Content-Type": "application/json"})
-            auth_data = login.json()
-            if login.status_code >= 400 or not auth_data.get("requestSuccessful"):
-                raise HTTPException(502, "Monnify authentication failed. Check sandbox credentials.")
-            token = (auth_data.get("responseBody") or {}).get("accessToken")
-            response = await client.request(method, f"{base_url}{path}", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json=payload)
+            response = await client.request(method, f"https://api.paystack.co{path}", headers={"Authorization": f"Bearer {secret}", "Content-Type": "application/json"}, json=payload)
     except httpx.RequestError as exc:
         raise HTTPException(502, "Could not connect to the payment provider. Please retry.") from exc
     if response.status_code >= 400:
-        raise HTTPException(502, "Monnify could not process this request. Check your sandbox credentials and contract.")
+        raise HTTPException(502, "The payment provider could not process this request.")
     result = response.json()
-    if not result.get("requestSuccessful"):
-        raise HTTPException(502, "Monnify rejected this request.")
-    return result.get("responseBody", {})
+    if not result.get("status"):
+        raise HTTPException(502, "The payment provider rejected this request.")
+    return result.get("data", {})
 
 @app.post("/api/v1/payments/initialize", status_code=201)
 async def initialize_payment(payload: PaymentInitialize, buyer: User = Depends(require_roles("BUYER", "ADMIN")), db: Session = Depends(get_db)):
-    if not all(os.getenv(key, "").strip() for key in ("MONNIFY_API_KEY", "MONNIFY_SECRET_KEY", "MONNIFY_CONTRACT_CODE")):
-        raise HTTPException(503, "Payments are not configured. Add Monnify sandbox API key, secret, and contract code to the backend environment.")
+    if not os.getenv("PAYSTACK_SECRET_KEY", "").strip():
+        raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
     inventory = db.scalar(select(Inventory).where(Inventory.id == payload.inventory_id).with_for_update())
     if not inventory:
         raise HTTPException(404, "Listing not found")
@@ -150,28 +142,25 @@ async def initialize_payment(payload: PaymentInitialize, buyer: User = Depends(r
         raise HTTPException(422, "Requested quantity exceeds available inventory")
     total_ngn = (Decimal(str(inventory.asking_price_per_ton_ngn)) * Decimal(str(payload.quantity_tons))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     amount_subunit = int(total_ngn * 100)
-    if amount_subunit < 100:
-        raise HTTPException(422, "Payment amount must be at least ₦1")
+    if amount_subunit < 5000:
+        raise HTTPException(422, "Paystack NGN transactions must be at least ₦50")
     reference = "CG-" + uuid.uuid4().hex
     payment = PaymentTransaction(inventory_id=inventory.id, buyer_user_id=buyer.id, buyer_name=buyer.full_name, buyer_email=buyer.email,
         quantity_tons=payload.quantity_tons, currency="NGN", amount_subunit=amount_subunit, status="PENDING", reference=reference)
     db.add(payment)
     db.commit()
-    callback_url = os.getenv("MONNIFY_CALLBACK_URL", "http://localhost:3000/payment/return")
+    callback_url = os.getenv("PAYSTACK_CALLBACK_URL", "http://localhost:3000/payment/return")
     try:
-        checkout = await monnify_request("/api/v1/merchant/transactions/init-transaction", method="POST", payload={
-            "amount": float(total_ngn), "customerName": payment.buyer_name, "customerEmail": payment.buyer_email,
-            "currencyCode": "NGN", "paymentReference": reference, "paymentDescription": f"CropGrid purchase: {inventory.crop_name}",
-            "contractCode": os.getenv("MONNIFY_CONTRACT_CODE", "").strip(), "redirectUrl": callback_url,
-            "paymentMethods": ["CARD", "ACCOUNT_TRANSFER", "USSD"],
-            "metadata": {"inventory_id": inventory.id, "quantity_tons": payload.quantity_tons},
+        checkout = await paystack_request("/transaction/initialize", method="POST", payload={
+            "email": payment.buyer_email, "amount": amount_subunit, "currency": "NGN", "reference": reference,
+            "callback_url": callback_url, "metadata": {"inventory_id": inventory.id, "quantity_tons": payload.quantity_tons},
         })
     except HTTPException:
         payment.status = "FAILED"
         db.commit()
         raise
-    authorization_url = checkout.get("checkoutUrl")
-    if not authorization_url or not authorization_url.startswith("https://"):
+    authorization_url = checkout.get("authorization_url")
+    if not authorization_url or not authorization_url.startswith("https://checkout.paystack.com/"):
         payment.status = "FAILED"
         db.commit()
         raise HTTPException(502, "The payment provider returned an invalid checkout URL.")
@@ -185,20 +174,20 @@ async def verify_and_record_payment(reference: str, db: Session):
         raise HTTPException(404, "Payment reference not found")
     if payment.status in {"SUCCESS", "PAID_REVIEW", "FAILED"}:
         return payment
-    provider = await monnify_request(f"/api/v2/merchant/transactions/query?paymentReference={reference}")
+    provider = await paystack_request(f"/transaction/verify/{reference}")
     try:
-        provider_amount = int(Decimal(str(provider.get("amountPaid", -1))) * 100)
+        provider_amount = int(provider.get("amount", -1))
     except (TypeError, ValueError):
         provider_amount = -1
-    provider_succeeded = provider.get("paymentStatus") == "PAID"
-    verified = (provider.get("paymentReference") == payment.reference
+    provider_succeeded = provider.get("status") == "success"
+    verified = (provider.get("reference") == payment.reference
         and provider_succeeded
-        and provider.get("currencyCode") == payment.currency
+        and provider.get("currency") == payment.currency
         and provider_amount == payment.amount_subunit)
     if provider_succeeded:
         if not verified or payment.status == "EXPIRED":
             payment.status = "PAID_REVIEW"
-            payment.provider_transaction_id = str(provider.get("transactionReference", "")) or None
+            payment.provider_transaction_id = str(provider.get("id", "")) or None
             db.commit()
             return payment
         inventory = db.scalar(select(Inventory).where(Inventory.id == payment.inventory_id).with_for_update())
@@ -209,11 +198,11 @@ async def verify_and_record_payment(reference: str, db: Session):
             # Provider has captured a valid payment but the stock is gone. Do
             # not mark it as fulfilled; it needs a manual refund/reconciliation.
             payment.status = "PAID_REVIEW"
-        payment.provider_transaction_id = str(provider.get("transactionReference", "")) or None
+        payment.provider_transaction_id = str(provider.get("id", "")) or None
         db.commit()
-    elif provider.get("paymentStatus") in {"FAILED", "EXPIRED", "REVERSED"}:
+    elif provider.get("status") in {"failed", "abandoned"}:
         payment.status = "FAILED"
-        payment.provider_transaction_id = str(provider.get("transactionReference", "")) or None
+        payment.provider_transaction_id = str(provider.get("id", "")) or None
         db.commit()
     return payment
 
@@ -237,24 +226,21 @@ def my_orders(user: User = Depends(get_current_user), db: Session = Depends(get_
              "created_at": payment.created_at.isoformat()} for payment, inventory in db.execute(statement).all()]
 
 @app.post("/api/v1/payments/webhook")
-async def monnify_webhook(request: Request, db: Session = Depends(get_db)):
-    secret = os.getenv("MONNIFY_SECRET_KEY", "").strip()
+async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
+    secret = os.getenv("PAYSTACK_SECRET_KEY", "").strip()
     if not secret:
         raise HTTPException(503, "Payment webhook is not configured")
     raw = await request.body()
-    supplied = request.headers.get("monnify-signature", "")
-    if supplied:
-        expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
-        if not hmac.compare_digest(supplied.lower(), expected.lower()):
-            raise HTTPException(401, "Invalid payment webhook signature")
-    elif os.getenv("MONNIFY_ENV", "sandbox").lower() == "production":
-        raise HTTPException(401, "Missing payment webhook signature")
+    supplied = request.headers.get("x-paystack-signature", "")
+    expected = hmac.new(secret.encode(), raw, hashlib.sha512).hexdigest()
+    if not hmac.compare_digest(supplied, expected):
+        raise HTTPException(401, "Invalid payment webhook signature")
     try:
         event = json.loads(raw or b"{}")
     except json.JSONDecodeError as exc:
         raise HTTPException(400, "Malformed webhook payload") from exc
-    if event.get("eventType") == "SUCCESSFUL_TRANSACTION":
-        reference = str((event.get("eventData") or {}).get("paymentReference", ""))
+    if event.get("event") == "charge.success":
+        reference = str((event.get("data") or {}).get("reference", ""))
         if reference:
             await verify_and_record_payment(reference, db)
     return {"received": True}
