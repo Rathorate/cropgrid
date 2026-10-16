@@ -1,5 +1,13 @@
 # CropGrid
 
+See [SUPPORT_UPDATE.md](SUPPORT_UPDATE.md) for the listing AI diagnostics,
+help assistant, offline help articles and private support request workflow.
+
+The latest media, chat, delivery and AI changes are documented in [TRADING_UPDATE.md](TRADING_UPDATE.md).
+Marketplace checkout currently supports **Paystack test keys only**. Escrow holding,
+seller fund release and refunds are not implemented. Receipt confirmation records
+delivery without moving funds.
+
 CropGrid is a runnable full-stack MVP for Nigerian agricultural commodity trade, based on the supplied CropGrid architecture specification. It includes a responsive marketplace, inventory APIs, local SQLite persistence, OpenAI voice listing extraction, and a Paystack hosted checkout integration in NGN. International cardholders can pay against NGN prices and their issuer may convert the charge; explicit USD-denominated pricing is not enabled by default.
 
 ## Run locally

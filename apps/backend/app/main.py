@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from starlette.concurrency import run_in_threadpool
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
@@ -13,8 +14,13 @@ from sqlalchemy.orm import Session
 import httpx
 from .database import Base, SessionLocal, engine, get_db
 from .models import Inventory, ListingReport, Order, PaymentTransaction, User
-from .schemas import InventoryCreate, ListingReportCreate, ListingReportUpdate, OrderCreate, PaymentInitialize
+from .schemas import InventoryCreate, ListingReportCreate, ListingReportUpdate, ListingTextInput, OrderCreate, PaymentInitialize
 from .auth import bootstrap_admin, get_current_user, require_roles, router as auth_router
+from .ai_errors import provider_error
+from .listing_ai import extract_listing_draft, NoListingFound, ListingResponseError
+from .trading import router as trading_router, listing_response
+from .models import Fulfillment
+from .support import router as support_router
 
 Base.metadata.create_all(bind=engine)
 for table, column, ddl in (
@@ -27,8 +33,10 @@ for table, column, ddl in (
 bootstrap_admin()
 app = FastAPI(title="CropGrid API", version="0.2.0", description="CropGrid MVP API. Paystack checkout is available when configured; escrow and export compliance are not provided.")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if x.strip()]
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type"])
+app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["GET", "POST", "PATCH"], allow_headers=["Content-Type", "Range"], expose_headers=["Content-Range", "Accept-Ranges", "Retry-After"])
 app.include_router(auth_router)
+app.include_router(trading_router)
+app.include_router(support_router)
 
 def seed_demo_inventory():
     """Keep the local demo usable while still permitting an empty production database."""
@@ -63,7 +71,7 @@ def list_inventories(q: str = Query(default="", max_length=100), crop: str = Que
         stmt = stmt.where((Inventory.crop_name.ilike(f"%{q}%")) | (Inventory.location_state.ilike(f"%{q}%")))
     if crop:
         stmt = stmt.where(Inventory.crop_name.ilike(f"%{crop}%"))
-    return db.scalars(stmt.limit(100)).all()
+    return [listing_response(row, db) for row in db.scalars(stmt.limit(100)).all()]
 
 @app.post("/api/v1/inventories", status_code=201)
 def create_inventory(payload: InventoryCreate, seller: User = Depends(require_roles("SELLER", "ADMIN")), db: Session = Depends(get_db)):
@@ -71,7 +79,7 @@ def create_inventory(payload: InventoryCreate, seller: User = Depends(require_ro
     db.add(row)
     db.commit()
     db.refresh(row)
-    return row
+    return listing_response(row, db)
 
 @app.post("/api/v1/orders/escrow-initiate", status_code=201)
 def initiate_demo_order(payload: OrderCreate, db: Session = Depends(get_db)):
@@ -118,6 +126,8 @@ async def paystack_request(path: str, *, method: str = "GET", payload: dict | No
 
 @app.post("/api/v1/payments/initialize", status_code=201)
 async def initialize_payment(payload: PaymentInitialize, buyer: User = Depends(require_roles("BUYER", "ADMIN")), db: Session = Depends(get_db)):
+    if os.getenv("PAYSTACK_SECRET_KEY", "").strip().startswith("sk_live_"):
+        raise HTTPException(503, "Live marketplace checkout is not enabled. Complete the approved payment holding and payout integration first. Use a Paystack test key for now.")
     if not os.getenv("PAYSTACK_SECRET_KEY", "").strip():
         raise HTTPException(503, "Payments are not configured. Add a Paystack test secret key to the backend environment.")
     inventory = db.scalar(select(Inventory).where(Inventory.id == payload.inventory_id).with_for_update())
@@ -223,6 +233,11 @@ def my_orders(user: User = Depends(get_current_user), db: Session = Depends(get_
     statement = statement.order_by(PaymentTransaction.created_at.desc()).limit(100)
     return [{"reference": payment.reference, "crop_name": inventory.crop_name, "quantity_tons": payment.quantity_tons,
              "total_amount_ngn": str(Decimal(payment.amount_subunit) / 100), "status": payment.status,
+             "delivery_status": fulfillment.status if (fulfillment := db.get(Fulfillment, payment.id)) else "AWAITING_DISPATCH" if payment.status == "SUCCESS" else "NOT_PAID",
+             "tracking_details": fulfillment.tracking_details if fulfillment else "",
+             "dispute_reason": fulfillment.dispute_reason if fulfillment else "",
+             "funds_release_status": "NOT_ENABLED", "can_dispatch": inventory.seller_user_id == user.id,
+             "can_confirm_receipt": payment.buyer_user_id == user.id,
              "created_at": payment.created_at.isoformat()} for payment, inventory in db.execute(statement).all()]
 
 @app.post("/api/v1/payments/webhook")
@@ -245,11 +260,48 @@ async def paystack_webhook(request: Request, db: Session = Depends(get_db)):
             await verify_and_record_payment(reference, db)
     return {"received": True}
 
+AUDIO_EXTENSION_TO_MIME = {
+    ".flac": "audio/flac", ".mp3": "audio/mpeg", ".mp4": "audio/mp4",
+    ".mpeg": "audio/mpeg", ".mpga": "audio/mpeg", ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg", ".wav": "audio/wav", ".webm": "audio/webm",
+}
+AUDIO_MIME_TO_EXTENSION = {
+    "audio/flac": ".flac", "audio/x-flac": ".flac", "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3", "audio/mpeg3": ".mp3", "audio/x-mpeg-3": ".mp3",
+    "audio/mpga": ".mpga", "audio/mp4": ".m4a", "video/mp4": ".mp4",
+    "application/mp4": ".mp4", "audio/x-m4a": ".m4a", "audio/ogg": ".ogg",
+    "application/ogg": ".ogg", "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "audio/wave": ".wav", "audio/vnd.wave": ".wav", "audio/webm": ".webm",
+    "video/webm": ".webm",
+}
+
+@app.post("/api/v1/ai/parse-text")
+def parse_listing_text(payload: ListingTextInput, seller: User = Depends(require_roles("SELLER", "ADMIN"))):
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(503, "AI listing assistance is not configured. Add OPENAI_API_KEY to the backend environment.")
+    text_input = payload.text.strip()
+    if len(text_input) < 2:
+        raise HTTPException(422, "Enter a crop name or a fuller description.")
+    try:
+        return {"transcript": text_input, "draft": extract_listing_draft(text_input), "requires_human_review": True}
+    except NoListingFound as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ListingResponseError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except Exception as exc:
+        raise provider_error(exc) from exc
+
 @app.post("/api/v1/ai/parse-audio")
 async def parse_audio(file: UploadFile = File(...), seller: User = Depends(require_roles("SELLER", "ADMIN"))):
-    allowed = {"audio/mpeg", "audio/mp4", "audio/wav", "audio/x-wav", "audio/webm", "audio/ogg", "audio/mpga"}
-    if file.content_type not in allowed:
-        raise HTTPException(415, "Upload an MP3, MP4, WAV, WebM, or OGG audio file")
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    filename = file.filename or ""
+    extension = os.path.splitext(filename.lower())[1]
+    if extension not in AUDIO_EXTENSION_TO_MIME:
+        extension = AUDIO_MIME_TO_EXTENSION.get(content_type, "")
+        if extension:
+            filename = f"{os.path.splitext(filename)[0] or 'voice-note'}{extension}"
+    if extension not in AUDIO_EXTENSION_TO_MIME:
+        raise HTTPException(415, "Supported audio formats are MP3, MP4, M4A, MPEG, MPGA, OGG, WAV, WebM, and FLAC.")
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(503, "Voice parsing is not configured. Add OPENAI_API_KEY to enable this optional AI feature.")
     data = await file.read(20_000_001)
@@ -259,16 +311,24 @@ async def parse_audio(file: UploadFile = File(...), seller: User = Depends(requi
         raise HTTPException(422, "Audio file is empty")
     try:
         from openai import OpenAI
-        client = OpenAI()
-        transcript = client.audio.transcriptions.create(model="whisper-1", file=(file.filename or "voice.webm", data, file.content_type)).text
-        parsed = client.chat.completions.create(model=os.getenv("OPENAI_LISTING_MODEL", "gpt-4o-mini"), response_format={"type": "json_object"},
-            messages=[{"role":"system","content":"Extract a crop marketplace listing from the transcription. Return JSON keys crop_name, quantity_tons, location_state, asking_price_per_ton_ngn, moisture_percentage, description. Use null where uncertain. Never invent values."}, {"role":"user","content":transcript}])
-        import json
-        return {"transcript": transcript, "draft": json.loads(parsed.choices[0].message.content or "{}"), "requires_human_review": True}
+        client = OpenAI(timeout=60, max_retries=0)
+        normalized_name = filename or f"voice-note{extension}"
+        transcription = await run_in_threadpool(client.audio.transcriptions.create,
+            model=os.getenv("OPENAI_TRANSCRIPTION_MODEL", "whisper-1"),
+            file=(normalized_name, data, AUDIO_EXTENSION_TO_MIME[extension]),
+        )
+        transcript = transcription.text.strip()
+        if not transcript:
+            raise HTTPException(422, "No speech was detected. Try another recording.")
+        return {"transcript": transcript, "draft": await run_in_threadpool(extract_listing_draft, transcript), "requires_human_review": True}
     except HTTPException:
         raise
+    except NoListingFound as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ListingResponseError as exc:
+        raise HTTPException(502, str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(502, "AI transcription is temporarily unavailable") from exc
+        raise provider_error(exc) from exc
 
 @app.post("/api/v1/inventories/{inventory_id}/reports", status_code=201)
 def report_listing(inventory_id: int, payload: ListingReportCreate, reporter: User = Depends(get_current_user), db: Session = Depends(get_db)):

@@ -1,5 +1,11 @@
 # CropGrid deployment guide
 
+**Current release restriction:** marketplace checkout rejects live Paystack keys.
+The requested protected deposit and delivery-based release flow needs an approved
+provider integration before real payments can launch. See [TRADING_UPDATE.md](TRADING_UPDATE.md)
+for current media/storage, authentication-domain and payment limitations. Earlier
+instructions below about switching to a live key are deferred until that work is complete.
+
 This repository is a monorepo with two separately deployable services:
 
 - Frontend: Next.js in `apps/web` (deploy to Vercel).

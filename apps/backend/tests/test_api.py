@@ -116,19 +116,60 @@ class CropGridApiTests(unittest.TestCase):
         self.register_test_user("SELLER")
         old_key = os.environ.get("OPENAI_API_KEY")
         os.environ["OPENAI_API_KEY"] = "sk-test-mocked"
+        transcription_request = {}
+        def transcribe(**kwargs):
+            transcription_request.update(kwargs)
+            return SimpleNamespace(text="We have 20 tons of ginger in Kaduna.")
         fake_client = SimpleNamespace(
-            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(text="We have 20 tons of ginger in Kaduna."))),
+            audio=SimpleNamespace(transcriptions=SimpleNamespace(create=transcribe)),
             chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"crop_name":"Ginger","quantity_tons":20,"location_state":"Kaduna"}'))]))),
         )
         try:
             with patch("openai.OpenAI", return_value=fake_client):
-                response = self.request("POST", "/api/v1/ai/parse-audio", files={"file": ("note.wav", b"mock audio bytes", "audio/wav")})
+                response = self.request("POST", "/api/v1/ai/parse-audio", files={"file": ("note.m4a", b"mock audio bytes", "application/octet-stream")})
             self.assertEqual(response.status_code, 200, response.text)
             result = response.json()
             self.assertEqual(result["transcript"], "We have 20 tons of ginger in Kaduna.")
             self.assertEqual(result["draft"]["crop_name"], "Ginger")
             self.assertEqual(result["draft"]["quantity_tons"], 20)
             self.assertTrue(result["requires_human_review"])
+            self.assertEqual(transcription_request["file"][0], "note.m4a")
+            self.assertEqual(transcription_request["file"][2], "audio/mp4")
+        finally:
+            if old_key is None:
+                os.environ.pop("OPENAI_API_KEY", None)
+            else:
+                os.environ["OPENAI_API_KEY"] = old_key
+
+    def test_audio_parser_rejects_unsupported_file_format(self):
+        self.register_test_user("SELLER")
+        response = self.request("POST", "/api/v1/ai/parse-audio", files={"file": ("note.aiff", b"audio", "audio/aiff")})
+        self.assertEqual(response.status_code, 415)
+
+    def test_text_parser_requires_provider_configuration(self):
+        import os
+        self.register_test_user("SELLER")
+        old_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            response = self.request("POST", "/api/v1/ai/parse-text", json={"text":"20 tons of ginger in Kaduna at 1,850,000 naira per ton."})
+            self.assertEqual(response.status_code, 503)
+        finally:
+            if old_key is not None:
+                os.environ["OPENAI_API_KEY"] = old_key
+
+    def test_text_parser_returns_reviewable_listing_draft(self):
+        import os
+        self.register_test_user("SELLER")
+        old_key = os.environ.get("OPENAI_API_KEY")
+        os.environ["OPENAI_API_KEY"] = "sk-test-mocked"
+        fake_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='{"crop_name":"Ginger","quantity_tons":20,"location_state":"Kaduna"}'))]))))
+        try:
+            with patch("openai.OpenAI", return_value=fake_client):
+                response = self.request("POST", "/api/v1/ai/parse-text", json={"text":"We have 20 tons of ginger in Kaduna."})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["draft"]["crop_name"], "Ginger")
+            self.assertEqual(response.json()["transcript"], "We have 20 tons of ginger in Kaduna.")
+            self.assertTrue(response.json()["requires_human_review"])
         finally:
             if old_key is None:
                 os.environ.pop("OPENAI_API_KEY", None)

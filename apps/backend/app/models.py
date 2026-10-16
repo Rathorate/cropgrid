@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, LargeBinary, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from .database import Base
 
@@ -17,6 +17,40 @@ class Inventory(Base):
     is_export_ready: Mapped[bool] = mapped_column(Boolean, default=False)
     description: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class ListingMedia(Base):
+    __tablename__ = "listing_media"
+    __table_args__ = (UniqueConstraint("inventory_id", "content_hash"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inventory_id: Mapped[int] = mapped_column(ForeignKey("inventories.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(8))
+    mime_type: Mapped[str] = mapped_column(String(40))
+    content_hash: Mapped[str] = mapped_column(String(64))
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    __table_args__ = (UniqueConstraint("inventory_id", "buyer_user_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    inventory_id: Mapped[int] = mapped_column(ForeignKey("inventories.id"), index=True)
+    buyer_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    seller_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), index=True)
+    sender_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    body: Mapped[str] = mapped_column(String(2000))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+class Fulfillment(Base):
+    __tablename__ = "fulfillments"
+    payment_id: Mapped[int] = mapped_column(ForeignKey("payment_transactions.id"), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), default="AWAITING_DISPATCH")
+    tracking_details: Mapped[str] = mapped_column(String(500), default="")
+    dispute_reason: Mapped[str] = mapped_column(String(1000), default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 class User(Base):
     __tablename__ = "users"

@@ -18,6 +18,9 @@ class ListingReportCreate(BaseModel):
 class ListingReportUpdate(BaseModel):
     status: Literal["REVIEWING", "RESOLVED", "DISMISSED"]
 
+class ListingTextInput(BaseModel):
+    text: str = Field(min_length=2, max_length=5000)
+
 class InventoryCreate(BaseModel):
     supplier_name: str = Field(default="CropGrid Supplier", min_length=2, max_length=120)
     crop_name: str = Field(min_length=2, max_length=80)

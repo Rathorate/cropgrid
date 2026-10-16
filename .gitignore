@@ -7,5 +7,6 @@ __pycache__/
 node_modules/
 .next/
 *.log
+*.bak
 .uv-cache/
 *.tsbuildinfo
