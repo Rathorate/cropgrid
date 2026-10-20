@@ -21,6 +21,7 @@ from .listing_ai import extract_listing_draft, NoListingFound, ListingResponseEr
 from .trading import router as trading_router, listing_response
 from .models import Fulfillment
 from .support import router as support_router
+from .password_recovery import router as recovery_router
 
 Base.metadata.create_all(bind=engine)
 for table, column, ddl in (
@@ -37,6 +38,14 @@ app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True
 app.include_router(auth_router)
 app.include_router(trading_router)
 app.include_router(support_router)
+app.include_router(recovery_router)
+
+@app.middleware("http")
+async def prevent_api_response_caching(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/v1/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 def seed_demo_inventory():
     """Keep the local demo usable while still permitting an empty production database."""

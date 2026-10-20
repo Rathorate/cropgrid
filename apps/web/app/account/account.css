@@ -1,0 +1,9 @@
+.accountFields{border:0;padding:0;margin:0;display:grid;gap:20px;min-width:0}
+.passwordField{display:grid;gap:8px;min-width:0}
+.passwordControl{position:relative;min-width:0}
+.passwordControl input{width:100%;padding-right:100px}
+.accountForm .passwordToggle{position:absolute;right:8px;top:50%;transform:translateY(-50%);display:flex;align-items:center;gap:6px;border:0;border-radius:7px;padding:9px;background:transparent;color:#286440;font:inherit;font-size:13px;cursor:pointer}
+.accountForm .passwordToggle:hover{background:#edf5ee}
+.accountForm .passwordToggle:focus-visible{outline:2px solid #286440;outline-offset:2px}
+.accountNotice{padding:14px 16px;border:1px solid #b9d6c0;border-radius:9px;background:#f0f8f1;color:#245c37;line-height:1.6}
+.accountSwitch button:disabled{opacity:.6;cursor:wait}

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Literal
 
 class RegisterCreate(BaseModel):
@@ -6,6 +6,13 @@ class RegisterCreate(BaseModel):
     email: str = Field(min_length=6, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     password: str = Field(min_length=10, max_length=128)
     role: Literal["BUYER", "SELLER"]
+
+    @field_validator("password")
+    @classmethod
+    def meaningful_password(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Choose a password containing more than spaces.")
+        return value
 
 class LoginCreate(BaseModel):
     email: str = Field(min_length=6, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
