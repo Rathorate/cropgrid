@@ -195,7 +195,10 @@ async def verify_and_record_payment(reference: str, db: Session):
         and provider.get("currency") == payment.currency
         and provider_amount == payment.amount_subunit)
     if provider_succeeded:
-        if not verified or payment.status == "EXPIRED":
+        created = payment.created_at.replace(tzinfo=timezone.utc) if payment.created_at.tzinfo is None else payment.created_at.astimezone(timezone.utc)
+        reservation_expired = created < datetime.now(timezone.utc) - timedelta(minutes=20)
+        # Expiry must not depend on whether another buyer happened to start checkout.
+        if not verified or payment.status == "EXPIRED" or reservation_expired:
             payment.status = "PAID_REVIEW"
             payment.provider_transaction_id = str(provider.get("id", "")) or None
             db.commit()

@@ -14,6 +14,13 @@ This repository is a monorepo with two separately deployable services:
 
 The frontend and backend communicate over HTTPS. The browser must be able to reach the public API URL, and the API must allow the exact frontend origin through CORS.
 
+**Authentication setup:** session cookies currently use `SameSite=Lax`. Use HTTPS
+frontend/API subdomains of the same site (for example `app.example.com` and
+`api.example.com`), or implement and test a same-origin API proxy. The unrelated
+default Vercel and Render hostnames below are service examples, not a verified
+cross-site cookie configuration. Confirm login persists and authenticated POSTs
+work on your final domains. Complete [TESTING.md](TESTING.md) before launch.
+
 ## 1. Deploy the backend and database
 
 1. In Render, create a managed PostgreSQL database. Choose a paid persistent plan for any pilot that stores real supplier or buyer data; free resources are for evaluation and can have availability or persistence limits. Keep the database internal to Render where possible.
@@ -29,9 +36,12 @@ The frontend and backend communicate over HTTPS. The browser must be able to rea
    | `AUTH_COOKIE_SECURE` | `true` for HTTPS deployments |
    | `ADMIN_EMAIL` | Private administrator email; do not use a public signup for admins |
    | `ADMIN_PASSWORD` | Strong private password (at least 16 characters); stored only in the hosting secret settings |
-   | `OPENAI_API_KEY` | Your OpenAI key, if enabling the voice listing feature |
-   | `OPENAI_LISTING_MODEL` | `gpt-4o-mini` (optional; this is the default) |
-   | `PAYSTACK_SECRET_KEY` | Paystack **test** secret key for sandbox testing; switch to a live key only after merchant approval and a reviewed launch |
+   | `OPENAI_API_KEY` | Private API key for the configured compatible AI provider |
+   | `OPENAI_BASE_URL` | Compatible provider endpoint if using a provider other than OpenAI; omit for the OpenAI default |
+   | `OPENAI_LISTING_MODEL` | A listing model supported by that provider |
+   | `OPENAI_SUPPORT_MODEL` | A support model supported by that provider |
+   | `OPENAI_TRANSCRIPTION_MODEL` | A transcription model supported by that provider |
+   | `PAYSTACK_SECRET_KEY` | Paystack **test** secret key only; live keys are blocked in this release |
    | `PAYSTACK_CALLBACK_URL` | The frontend payment return URL, e.g. `https://<your-site>/payment/return` |
 
    Keep secret values in the provider dashboard. Do not commit them to GitHub. The API Dockerfile uses the platform-provided `PORT`, and the backend normalizes standard PostgreSQL URL schemes to the installed Psycopg 3 driver.
@@ -62,7 +72,7 @@ After deploying, test using Paystack test credentials and test payment methods, 
 
 1. Add `OPENAI_API_KEY` only to the backend environment in Render. Never add it to Vercel or a `NEXT_PUBLIC_` variable.
 2. Redeploy the backend after saving the key.
-3. In the frontend, choose **Add a listing → Voice draft**, upload a short supported audio file, and review the transcript-derived fields before publishing.
+3. Sign in as a seller, open **AI listing assistant**, choose text or a short supported audio file, and review the transcript-derived fields before continuing to a new listing.
 4. Test unclear speech and missing price/location. Confirm uncertain fields stay empty and the interface does not publish until required fields are supplied. Keep a human review step; AI extraction can be wrong.
 
 ## 4. Update from WSL after changes

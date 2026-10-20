@@ -1,5 +1,8 @@
 # CropGrid
 
+See [TESTING.md](TESTING.md) for the latest test evidence, safe WSL test commands,
+real-provider acceptance steps and remaining launch gates.
+
 See [SUPPORT_UPDATE.md](SUPPORT_UPDATE.md) for the listing AI diagnostics,
 help assistant, offline help articles and private support request workflow.
 

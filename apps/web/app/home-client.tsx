@@ -220,7 +220,7 @@ export default function Home() {
       const response = await fetch(`${api}/api/v1/payments/initialize`, { method: "POST", credentials: "include", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ inventory_id: checkoutListing.id, quantity_tons: Number(checkoutForm.quantity_tons), buyer_name: account?.full_name || checkoutForm.buyer_name, buyer_email: account?.email || checkoutForm.buyer_email, currency: "NGN" }) });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(typeof result.detail === "string" ? result.detail : "Could not start checkout.");
-      if (typeof result.authorization_url !== "string" || !result.authorization_url.startsWith("https://")) throw new Error("The payment provider returned an invalid checkout link.");
+      if (typeof result.authorization_url !== "string" || !result.authorization_url.startsWith("https://checkout.paystack.com/")) throw new Error("The payment provider returned an invalid checkout link.");
       window.location.assign(result.authorization_url);
     } catch (error) {
       setCheckoutError(error instanceof Error ? error.message : "Could not start checkout. Please try again.");
